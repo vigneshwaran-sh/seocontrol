@@ -1,0 +1,59 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+.venv/
+env/
+.Python
+
+# Environment variables
+.env
+.env.*
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+*.egg
+*.whl
+
+# Testing
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Type checking / linting
+.mypy_cache/
+.ruff_cache/
+
+# Celery
+celery_*.log
+celery_*.pid
+celerybeat-schedule
+celerybeat-schedule.db
+celerybeat-schedule-shm
+celerybeat-schedule-wal
+
+# Assets (generated thumbnails)
+assets/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
