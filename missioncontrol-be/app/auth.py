@@ -1,5 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
+# passlib 1.7.4 reads bcrypt.__about__.__version__, which bcrypt>=4.0 removed.
+import bcrypt as _bcrypt
+if not hasattr(_bcrypt, '__about__'):
+    class _About:
+        __version__ = _bcrypt.__version__
+    _bcrypt.__about__ = _About()
+
 from bson import ObjectId
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -17,11 +24,11 @@ ALGORITHM = "HS256"
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return pwd_context.hash(password.encode()[:72])
 
 
 def verify_password(plain: str, hashed: str) -> bool:
-    return pwd_context.verify(plain, hashed)
+    return pwd_context.verify(plain.encode()[:72], hashed)
 
 
 def create_access_token(data: dict, expires_delta: timedelta | None = None) -> str:

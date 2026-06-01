@@ -187,10 +187,6 @@ async def delete_space(org_id: str, space_id: str, user: dict = Depends(get_curr
     # Cascade delete all related data
     await db.tasks.delete_many({"space_id": space_id})
     await db.task_statuses.delete_many({"space_id": space_id})
-    await db.folders.delete_many({"space_id": space_id})
-    await db.documents.delete_many({"space_id": space_id})
-
-    # Delete agents
     await db.agents.delete_many({"space_id": space_id})
 
     await db.spaces.delete_one({"_id": ObjectId(space_id)})

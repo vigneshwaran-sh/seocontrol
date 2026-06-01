@@ -72,16 +72,17 @@ Two paths (same caching pattern as writer, stored in `_llm_messages_validator`):
 - `_call_agent_llm_cached(db, agent, space_id, messages)` — multi-turn call; returns `(response_text, updated_messages)`
 - `_post_comment(db, task_id, agent_id, agent_name, content, mentions)` — inserts a comment on behalf of an agent
 - `_create_task(...)` — inserts a task, auto-positions at end of the status column
-- `_log_llm_call(...)` — persists full LLM request/response to `llm_logs` collection
 - `_parse_json_from_llm(text)` — extracts JSON from LLM output; handles ````json` code blocks and raw JSON
 - `_clear_processing_flag(db, task_id)` — `$unset` the `_agent_processing` lock; **must be called on all exit paths**
 - `_build_agent_system_prompt(agent, system_extra)` — prepends agent name + strips HTML tags from `skill_content` + appends role instructions
 
 ## LLM Layer (`llm.py`)
 
-Two public functions:
+Two public functions (both accept keyword-only `task_id=""`, `agent_id=""`, `space_id=""`):
 - `execute_with_llm(provider, model, api_key, system_prompt, user_prompt) → str` — one-shot; researcher and topic validator use this
 - `execute_with_llm_cached(provider, model, api_key, messages) → (str, list[dict])` — sends full messages array; writer and validator use this; returns updated messages with assistant turn appended
+
+Logging is done inside `llm.py` at the point of the actual API call via `_write_log()`. The logged `request` is the exact `**kwargs` dict passed to the provider SDK (raw messages array, model, etc.); `response` is the raw text returned. Each log entry also captures `requested_at`, `duration_ms`, `task_id`, `agent_id`, and `space_id`.
 
 OpenAI notes:
 - Tries `max_completion_tokens=16384` first (for reasoning models); falls back to `max_tokens=4096`

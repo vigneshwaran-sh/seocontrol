@@ -42,7 +42,7 @@ Pipeline dispatch happens in two ways:
 - OpenAI gets a special cached path (`execute_with_llm_cached`) for the writer/validator revision loop: conversation history is persisted on the task doc (`_llm_messages_writer`, `_llm_messages_validator`) and replayed to benefit from OpenAI prefix caching
 
 ### MongoDB collections
-`users`, `organizations`, `spaces`, `tasks`, `task_statuses`, `documents`, `folders`, `agents`, `comments`, `llm_logs`, `org_settings`
+`users`, `organizations`, `spaces`, `tasks`, `task_statuses`, `agents`, `comments`, `llm_logs`, `org_settings`
 
 ### Task internal fields (underscore-prefixed, not in API response)
 - `_agent_processing` — lock flag; prevents duplicate Celery dispatches

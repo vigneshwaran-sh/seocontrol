@@ -59,12 +59,11 @@ All routers live in `app/routers/`. URL prefixes:
 - `/api/orgs/{org_id}/spaces` — space CRUD (also auto-seeds 4 pipeline agents + 4 default statuses on create)
 - `/api/orgs/{org_id}/settings` — API keys and Notion config (admin-only writes; keys are masked on read)
 - `/api/spaces/{space_id}/tasks` — tasks, task statuses, comments
-- `/api/spaces/{space_id}/documents` — docs and folders
 - `/api/spaces/{space_id}/agents` — pipeline agent CRUD
 - `/api/spaces/{space_id}/logs` — LLM call logs
 
 ### Models
-`app/models/` contains Pydantic models (Create, Update, Response) for each entity. MongoDB documents are raw dicts; Pydantic only validates API input/output, not DB writes.
+`app/models/` contains Pydantic models (Create, Update, Response) for each entity — user, organization, space, task, agent, settings, llm_log. MongoDB documents are raw dicts; Pydantic only validates API input/output, not DB writes.
 
 ### Settings / org_settings collection
 API keys (OpenAI, Gemini, Claude) and Notion credentials are stored in the `org_settings` collection, keyed by `org_id`. The `settings.py` router uses `upsert` so the doc is created on first save. Keys are masked on GET (shows only last 4 chars).
@@ -75,7 +74,7 @@ When a task is created or reassigned to an agent via the API (`app/routers/tasks
 Before dispatching, the task document gets `_agent_processing: True` set to prevent duplicate execution. It is cleared at the end of every Celery task (including on failure paths).
 
 ### LLM logging
-Every LLM call in the worker is logged to the `llm_logs` collection via `_log_llm_call()`. Stored fields: full request messages array, raw response text, provider, model, duration_ms, is_cached flag.
+Every LLM call is logged to the `llm_logs` collection directly inside `app/worker/llm.py` at the point of the API call. The logged `request` is the exact `**kwargs` dict sent to the provider SDK; `response` is raw text. Stored fields: `task_id`, `agent_id`, `space_id`, `provider`, `model`, `request` (dict), `response`, `duration_ms`, `requested_at`, `created_at`.
 
 ### Thumbnail generation
 `app/worker/thumbnail.py` — Generates an SVG file in `assets/` using a hardcoded gradient template. Called by Content Validator on approval; the file is uploaded to Notion then deleted locally.

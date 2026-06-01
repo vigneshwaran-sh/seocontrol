@@ -14,6 +14,9 @@ from notion_client import Client
 
 log = logging.getLogger(__name__)
 
+NOTION_API = "https://api.notion.com/v1"
+NOTION_VERSION = "2026-03-11"
+
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -115,18 +118,26 @@ def update_blog_content(
     Optionally update properties too.
     """
     notion = Client(auth=token)
+    norm_id = _normalize_id(page_id)
 
-    # Update properties if provided
+    # Erase the entire page body (and update properties) in a single request.
+    # Notion's `erase_content: true` flag wipes all existing blocks at once —
+    # no need to list + delete blocks individually.
+    payload: dict = {"erase_content": True}
     if properties:
-        notion.pages.update(page_id=page_id, properties=properties)
+        payload["properties"] = properties
 
-    # Delete existing blocks
-    existing_blocks = notion.blocks.children.list(block_id=page_id)
-    for block in existing_blocks.get("results", []):
-        try:
-            notion.blocks.delete(block_id=block["id"])
-        except Exception:
-            pass  # Some blocks may not be deletable
+    resp = httpx.patch(
+        f"{NOTION_API}/pages/{norm_id}",
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Notion-Version": NOTION_VERSION,
+            "Content-Type": "application/json",
+        },
+        json=payload,
+    )
+    resp.raise_for_status()
+    log.info(f"Erased content of Notion page {page_id}")
 
     # Convert and append new content
     if _looks_like_html(content):
@@ -183,10 +194,6 @@ def read_page_properties(token: str, page_id: str) -> dict:
             result[key] = str(val)
 
     return result
-
-
-NOTION_API = "https://api.notion.com/v1"
-NOTION_VERSION = "2026-03-11"
 
 
 def upload_image_to_page(token: str, page_id: str, file_path: str) -> dict:

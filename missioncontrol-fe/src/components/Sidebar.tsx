@@ -7,7 +7,6 @@ import {
   LogOut,
   Rocket,
   Columns3,
-  FileText,
   Bot,
   ScrollText,
   Search,
@@ -247,19 +246,6 @@ export default function Sidebar() {
                           Board
                         </NavLink>
                         <NavLink
-                          to={`/spaces/${space.id}/docs`}
-                          className={({ isActive }) =>
-                            `flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                              isActive
-                                ? 'text-accent-dark bg-accent-50/60'
-                                : 'text-warm-500 hover:text-warm-700 hover:bg-warm-50'
-                            }`
-                          }
-                        >
-                          <FileText className="h-3.5 w-3.5" />
-                          Docs
-                        </NavLink>
-                        <NavLink
                           to={`/spaces/${space.id}/agents`}
                           className={({ isActive }) =>
                             `flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${
@@ -368,7 +354,7 @@ export default function Sidebar() {
               ?
             </p>
             <p className="text-xs text-warm-400 mb-6">
-              All tasks, documents, and agents in this space will be permanently removed.
+              All tasks and agents in this space will be permanently removed.
             </p>
             <div className="flex justify-end gap-3">
               <button

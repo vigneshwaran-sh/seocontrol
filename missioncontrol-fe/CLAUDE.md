@@ -29,8 +29,6 @@ Route structure:
 /users                             → User management (admin only)
 /settings                          → API keys + Notion config (admin only)
 /spaces/:spaceId/tasks             → Kanban board
-/spaces/:spaceId/docs              → Document list
-/spaces/:spaceId/docs/:docId       → TipTap rich-text editor
 /spaces/:spaceId/agents            → Pipeline agent grid
 /spaces/:spaceId/agents/:agentId   → Agent detail / skill editor
 /spaces/:spaceId/logs              → LLM call log viewer
@@ -61,7 +59,7 @@ Two React contexts wrap the entire app:
 
 ### Types
 `src/types.ts` — All shared TypeScript interfaces and constants. Key items:
-- `Org`, `Space`, `Task`, `Agent`, `Comment`, `Doc`, `Folder`, `TaskStatus`
+- `Org`, `Space`, `Task`, `Agent`, `Comment`, `TaskStatus`
 - `PIPELINE_ROLES` — maps the 4 role keys to display labels/colours
 - `PROVIDER_OPTIONS` — `openai`, `gemini`, `claude`
 - `PRIORITY_OPTIONS` — `urgent`, `high`, `medium`, `low`, `none`
@@ -83,7 +81,6 @@ Two React contexts wrap the entire app:
 - `AgentDetail.tsx` — provider/model config + TipTap rich text editor for `skill_content` (the agent's instruction manual)
 - `LLMLogs.tsx` — filterable table of all LLM calls for a space, showing provider/model/duration/cache status
 - `Settings.tsx` — two-tab page: API keys (OpenAI/Gemini/Claude) + Notion integration setup
-- `DocEditor.tsx` — TipTap editor for internal knowledge docs
 
 ## Key Patterns
 

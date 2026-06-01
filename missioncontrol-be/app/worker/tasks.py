@@ -11,7 +11,6 @@ Pipeline:
 import json
 import logging
 import re
-import time
 from datetime import datetime
 
 from bson import ObjectId
@@ -19,7 +18,6 @@ from bson import ObjectId
 from app.celery_app import celery
 from app.config import settings
 from app.worker.db import get_sync_db
-from app.worker.llm import execute_with_llm
 
 log = logging.getLogger(__name__)
 
@@ -163,6 +161,66 @@ def _assign_task(db, task_id: str, agent_id: str):
     )
 
 
+def _extract_revision_feedback(comment_content: str) -> str:
+    """
+    Extract only the Remarks and Suggestions sections from a validator
+    feedback comment. Everything else (score header, Notion link, issues, etc.)
+    is stripped so the writer only receives actionable guidance.
+
+    Falls back to the full comment if neither section is found (e.g. plain-text
+    comments posted by humans).
+    """
+    parts = []
+
+    # **Remarks:** <single-line text>
+    remarks_match = re.search(r'\*\*Remarks:\*\*\s*(.+)', comment_content)
+    if remarks_match:
+        text = remarks_match.group(1).strip()
+        if text:
+            parts.append(f"Remarks: {text}")
+
+    # **Suggestions:** followed by bullet lines
+    suggestions_match = re.search(
+        r'\*\*Suggestions:\*\*[ \t]*\n((?:[ \t]*-[ \t]+.+\n?)*)',
+        comment_content,
+        re.MULTILINE,
+    )
+    if suggestions_match:
+        bullets = suggestions_match.group(1).strip()
+        if bullets:
+            parts.append(f"Suggestions:\n{bullets}")
+
+    if parts:
+        return "\n\n".join(parts)
+
+    # Fallback for plain-text / human comments: keep the text but drop any
+    # line referencing a Notion page URL (e.g. the "Reviewing content from
+    # Notion: https://notion.so/..." status comment) so it never reaches the LLM.
+    cleaned_lines = [
+        line
+        for line in comment_content.splitlines()
+        if not re.search(r"https?://(?:www\.)?notion\.so/\S+", line)
+    ]
+    return "\n".join(cleaned_lines).strip()
+
+
+def _html_to_text(html: str) -> str:
+    """Convert TipTap HTML to readable plain text preserving structure."""
+    # Block-level tags → newline before their content
+    html = re.sub(r"<(p|div|br|h[1-6])[^>]*>", "\n", html, flags=re.IGNORECASE)
+    # List items → bullet prefix
+    html = re.sub(r"<li[^>]*>", "\n- ", html, flags=re.IGNORECASE)
+    # Closing block tags → newline
+    html = re.sub(r"</(p|div|h[1-6]|ul|ol|li)[^>]*>", "\n", html, flags=re.IGNORECASE)
+    # Strip all remaining tags
+    html = re.sub(r"<[^>]+>", "", html)
+    # Decode common HTML entities
+    html = html.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&nbsp;", " ").replace("&#39;", "'").replace("&quot;", '"')
+    # Collapse 3+ consecutive newlines to 2
+    html = re.sub(r"\n{3,}", "\n\n", html)
+    return html.strip()
+
+
 def _build_agent_system_prompt(agent: dict, system_extra: str) -> str:
     """Build the full system prompt from agent config + role-specific instructions."""
     agent_name = agent.get("name", "Agent")
@@ -170,17 +228,22 @@ def _build_agent_system_prompt(agent: dict, system_extra: str) -> str:
 
     system_prompt = f"You are an AI agent named '{agent_name}'.\n"
     if skill_content:
-        clean_skills = re.sub(r"<[^>]+>", "", skill_content)
-        system_prompt += f"\nYour instructions:\n{clean_skills}\n"
+        clean_skills = _html_to_text(skill_content)
+        if clean_skills:
+            system_prompt += f"\nYour instructions:\n{clean_skills}\n"
     system_prompt += f"\n{system_extra}"
     return system_prompt
 
 
-def _call_agent_llm(db, agent: dict, space_id: str, system_extra: str, user_prompt: str) -> str:
+def _call_agent_llm(
+    db, agent: dict, space_id: str, system_extra: str, user_prompt: str,
+    task_id: str = "",
+) -> str:
     """Build system prompt from agent config and call LLM (one-shot)."""
     provider = agent.get("provider", "")
     model = agent.get("model", "")
     agent_name = agent.get("name", "Agent")
+    agent_id = str(agent.get("_id", ""))
 
     if not provider or not model:
         raise ValueError(f"Agent '{agent_name}' has no provider/model configured.")
@@ -198,11 +261,15 @@ def _call_agent_llm(db, agent: dict, space_id: str, system_extra: str, user_prom
         api_key=api_key,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
+        task_id=task_id,
+        agent_id=agent_id,
+        space_id=space_id,
     )
 
 
 def _call_agent_llm_cached(
     db, agent: dict, space_id: str, messages: list[dict],
+    task_id: str = "",
 ) -> tuple[str, list[dict]]:
     """
     Call LLM with a full messages array.
@@ -215,6 +282,7 @@ def _call_agent_llm_cached(
     provider = agent.get("provider", "")
     model = agent.get("model", "")
     agent_name = agent.get("name", "Agent")
+    agent_id = str(agent.get("_id", ""))
 
     if not provider or not model:
         raise ValueError(f"Agent '{agent_name}' has no provider/model configured.")
@@ -229,6 +297,9 @@ def _call_agent_llm_cached(
         model=model,
         api_key=api_key,
         messages=messages,
+        task_id=task_id,
+        agent_id=agent_id,
+        space_id=space_id,
     )
 
 
@@ -244,45 +315,6 @@ def _clear_processing_flag(db, task_id: str):
         {"$unset": {"_agent_processing": ""}},
     )
 
-
-def _log_llm_call(
-    db,
-    task_id: str,
-    task_title: str,
-    space_id: str,
-    agent_id: str,
-    agent_name: str,
-    agent_role: str,
-    provider: str,
-    model: str,
-    request: list[dict],
-    response: str,
-    is_cached: bool,
-    duration_ms: int,
-):
-    """
-    Persist an LLM call to the llm_logs collection.
-    `request` is the full messages array sent to the LLM (system + all turns).
-    `response` is the full text returned by the LLM.
-    """
-    try:
-        db.llm_logs.insert_one({
-            "task_id": task_id,
-            "task_title": task_title,
-            "space_id": space_id,
-            "agent_id": agent_id,
-            "agent_name": agent_name,
-            "agent_role": agent_role,
-            "provider": provider,
-            "model": model,
-            "request": request,
-            "response": response,
-            "is_cached": is_cached,
-            "duration_ms": duration_ms,
-            "created_at": datetime.utcnow(),
-        })
-    except Exception as exc:
-        log.warning(f"Failed to persist LLM log: {exc}")
 
 
 def _parse_json_from_llm(text: str) -> dict | list:
@@ -523,20 +555,7 @@ def run_content_researcher(self, space_id: str):
     )
 
     try:
-        t0 = time.time()
-        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt)
-        _log_llm_call(
-            db, task_id="", task_title=f"Research: {niche}",
-            space_id=space_id, agent_id=agent_id, agent_name=agent_name,
-            agent_role=ROLE_RESEARCHER,
-            provider=agent.get("provider", ""), model=agent.get("model", ""),
-            request=[
-                {"role": "system", "content": _build_agent_system_prompt(agent, system_extra)},
-                {"role": "user", "content": user_prompt},
-            ],
-            response=output,
-            is_cached=False, duration_ms=int((time.time() - t0) * 1000),
-        )
+        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt, task_id="")
     except Exception as exc:
         log.exception(f"Content Researcher LLM failed for space {space_id}: {exc}")
         try:
@@ -626,20 +645,7 @@ def run_topic_validator(self, task_id: str, space_id: str):
     )
 
     try:
-        t0 = time.time()
-        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt)
-        _log_llm_call(
-            db, task_id=task_id, task_title=task.get("title", ""),
-            space_id=space_id, agent_id=agent_id, agent_name=agent_name,
-            agent_role=ROLE_TOPIC_VALIDATOR,
-            provider=agent.get("provider", ""), model=agent.get("model", ""),
-            request=[
-                {"role": "system", "content": _build_agent_system_prompt(agent, system_extra)},
-                {"role": "user", "content": user_prompt},
-            ],
-            response=output,
-            is_cached=False, duration_ms=int((time.time() - t0) * 1000),
-        )
+        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt, task_id=task_id)
     except Exception as exc:
         log.exception(f"Topic Validator LLM failed: {exc}")
         _post_comment(db, task_id, agent_id, agent_name, f"Failed: {str(exc)}")
@@ -816,11 +822,14 @@ def run_content_writer(self, task_id: str, space_id: str):
         comments = list(
             db.comments.find({"task_id": task_id}).sort("created_at", -1).limit(5)
         )
-        feedback = "\n".join(
-            f"- {c.get('created_by_name', 'Reviewer')}: {c['content']}"
-            for c in comments
-            if c.get("created_by") != agent_id
-        )
+        feedback_items = []
+        for c in comments:
+            if c.get("created_by") == agent_id:
+                continue
+            extracted = _extract_revision_feedback(c["content"])
+            if extracted.strip():
+                feedback_items.append(extracted)
+        feedback = "\n\n---\n\n".join(feedback_items)
 
         revision_prompt = (
             f"The content validator has reviewed your blog post and requests revisions.\n\n"
@@ -839,11 +848,14 @@ def run_content_writer(self, task_id: str, space_id: str):
         comments = list(
             db.comments.find({"task_id": task_id}).sort("created_at", -1).limit(5)
         )
-        feedback = "\n".join(
-            f"- {c.get('created_by_name', 'Reviewer')}: {c['content']}"
-            for c in comments
-            if c.get("created_by") != agent_id
-        )
+        feedback_items = []
+        for c in comments:
+            if c.get("created_by") == agent_id:
+                continue
+            extracted = _extract_revision_feedback(c["content"])
+            if extracted.strip():
+                feedback_items.append(extracted)
+        feedback = "\n\n---\n\n".join(feedback_items)
         try:
             from app.worker.notion import read_page_content
             current_content = read_page_content(notion_token, notion_page_id)
@@ -881,26 +893,14 @@ def run_content_writer(self, task_id: str, space_id: str):
 
     # ── Call LLM ──
     try:
-        t0 = time.time()
         output, updated_messages = _call_agent_llm_cached(
-            db, agent, space_id, messages,
+            db, agent, space_id, messages, task_id=task_id,
         )
-        dur = int((time.time() - t0) * 1000)
 
         # Persist conversation for future cache hits
         db.tasks.update_one(
             {"_id": ObjectId(task_id)},
             {"$set": {"_llm_messages_writer": updated_messages}},
-        )
-
-        # Log LLM call — store the full request messages + response
-        _log_llm_call(
-            db, task_id=task_id, task_title=task_title,
-            space_id=space_id, agent_id=agent_id, agent_name=agent_name,
-            agent_role=ROLE_CONTENT_WRITER,
-            provider=provider, model=agent.get("model", ""),
-            request=messages, response=output,
-            is_cached=use_cache, duration_ms=dur,
         )
     except Exception as exc:
         log.exception(f"Content Writer LLM failed: {exc}")
@@ -1177,26 +1177,14 @@ def run_content_validator(self, task_id: str, space_id: str):
 
     # ── Call LLM ──
     try:
-        t0 = time.time()
         output, updated_messages = _call_agent_llm_cached(
-            db, agent, space_id, messages,
+            db, agent, space_id, messages, task_id=task_id,
         )
-        dur = int((time.time() - t0) * 1000)
 
         # Persist conversation for future cache hits
         db.tasks.update_one(
             {"_id": ObjectId(task_id)},
             {"$set": {"_llm_messages_validator": updated_messages}},
-        )
-
-        # Log LLM call — store the full request messages + response
-        _log_llm_call(
-            db, task_id=task_id, task_title=blog_title,
-            space_id=space_id, agent_id=agent_id, agent_name=agent_name,
-            agent_role=ROLE_CONTENT_VALIDATOR,
-            provider=provider, model=agent.get("model", ""),
-            request=messages, response=output,
-            is_cached=use_cache, duration_ms=dur,
         )
     except Exception as exc:
         log.exception(f"Content Validator LLM failed: {exc}")

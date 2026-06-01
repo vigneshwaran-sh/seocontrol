@@ -43,26 +43,6 @@ export interface Task {
   updated_at: string
 }
 
-export interface Folder {
-  id: string
-  space_id: string
-  name: string
-  parent_id: string | null
-  created_at: string
-  updated_at: string
-}
-
-export interface Doc {
-  id: string
-  space_id: string
-  folder_id: string | null
-  title: string
-  content: string
-  created_by: string
-  created_by_name?: string
-  created_at: string
-  updated_at: string
-}
 
 export const PRIORITY_OPTIONS = {
   urgent: { label: 'Urgent', color: 'bg-danger-light text-danger', dot: 'bg-danger' },

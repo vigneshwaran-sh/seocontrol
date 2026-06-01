@@ -5,17 +5,14 @@ from datetime import datetime
 class LLMLogResponse(BaseModel):
     id: str
     task_id: str
-    task_title: str
-    space_id: str
     agent_id: str
-    agent_name: str
-    agent_role: str
+    space_id: str
     provider: str
     model: str
-    request: list[dict]
+    request: dict
     response: str
-    is_cached: bool
     duration_ms: int
+    requested_at: datetime
     created_at: datetime
 
 

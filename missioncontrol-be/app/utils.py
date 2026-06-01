@@ -69,32 +69,6 @@ def serialize_task(task: dict) -> dict:
     }
 
 
-def serialize_folder(folder: dict) -> dict:
-    return {
-        "id": str(folder["_id"]),
-        "space_id": folder["space_id"],
-        "parent_id": folder.get("parent_id"),
-        "name": folder["name"],
-        "position": folder.get("position", 0),
-        "created_by": folder["created_by"],
-        "created_at": folder["created_at"],
-        "updated_at": folder["updated_at"],
-    }
-
-
-def serialize_doc(doc: dict) -> dict:
-    return {
-        "id": str(doc["_id"]),
-        "space_id": doc["space_id"],
-        "folder_id": doc.get("folder_id"),
-        "title": doc["title"],
-        "content": doc.get("content", ""),
-        "created_by": doc["created_by"],
-        "updated_by": doc["updated_by"],
-        "created_at": doc["created_at"],
-        "updated_at": doc["updated_at"],
-    }
-
 
 def serialize_comment(comment: dict) -> dict:
     return {
@@ -110,20 +84,28 @@ def serialize_comment(comment: dict) -> dict:
 
 
 def serialize_llm_log(log: dict) -> dict:
+    # Normalise request: new docs store a dict, old docs stored a list or plain string.
+    request = log.get("request")
+    if isinstance(request, list):
+        # Legacy format — wrap the messages list under a "messages" key
+        request = {"messages": request}
+    elif not isinstance(request, dict):
+        raw = log.get("input_prompt", "")
+        request = {"prompt": raw} if raw else {}
+
+    response = log.get("response") or log.get("output_response", "")
+
     return {
         "id": str(log["_id"]),
-        "task_id": log["task_id"],
-        "task_title": log.get("task_title", ""),
-        "space_id": log["space_id"],
-        "agent_id": log["agent_id"],
-        "agent_name": log.get("agent_name", ""),
-        "agent_role": log.get("agent_role", ""),
+        "task_id": log.get("task_id", ""),
+        "agent_id": log.get("agent_id", ""),
+        "space_id": log.get("space_id", ""),
         "provider": log.get("provider", ""),
         "model": log.get("model", ""),
-        "request": log.get("request", []),
-        "response": log.get("response", ""),
-        "is_cached": log.get("is_cached", False),
+        "request": request,
+        "response": response,
         "duration_ms": log.get("duration_ms", 0),
+        "requested_at": log.get("requested_at", log.get("created_at")),
         "created_at": log["created_at"],
     }
 
