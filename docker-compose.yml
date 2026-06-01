@@ -3,7 +3,7 @@
 # Services:
 #   proxy     — HTTP-only reverse proxy, routes by Host header:
 #               shipseo.reviewhandy.com      -> frontend
-#               api.shipseo.reviewhandy.com  -> backend
+#               api-shipseo.reviewhandy.com  -> backend
 #               (TLS is terminated upstream at Cloudflare)
 #   redis     — Celery broker + result backend
 #   backend   — FastAPI API (uvicorn)
@@ -105,7 +105,7 @@ services:
       context: ./missioncontrol-fe
       args:
         # Baked into the bundle at build time. Point at the public API domain.
-        VITE_API_URL: https://api.shipseo.reviewhandy.com
+        VITE_API_URL: https://api-shipseo.reviewhandy.com
     restart: unless-stopped
     expose:
       - "80"
