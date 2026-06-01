@@ -1,0 +1,116 @@
+# MissionControl — full stack behind an nginx reverse proxy.
+#
+# Services:
+#   proxy     — HTTP-only reverse proxy, routes by Host header:
+#               shipseo.reviewhandy.com      -> frontend
+#               api.shipseo.reviewhandy.com  -> backend
+#               (TLS is terminated upstream at Cloudflare)
+#   redis     — Celery broker + result backend
+#   backend   — FastAPI API (uvicorn)
+#   worker    — Celery worker (runs the 4-agent pipeline tasks)
+#   beat      — Celery beat (heartbeat: poll_agent_tasks + daily researcher cron)
+#   frontend  — React build served by nginx (internal only, fronted by proxy)
+#
+# MongoDB is external (Atlas) — configured via missioncontrol-be/.env (MONGODB_URL).
+#
+# Networking:
+#   - Point the Cloudflare DNS (proxied) records for both hostnames at this host
+#   - Only port 80 is exposed; Cloudflare connects to the origin over HTTP
+#
+# Usage:
+#   docker compose up --build           # build + start everything
+#   docker compose up -d                # start in background
+#   docker compose logs -f proxy        # watch routing logs
+#   docker compose down                 # stop + remove
+
+services:
+  proxy:
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./reverse-proxy.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - frontend
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    image: missioncontrol-backend:latest
+    build:
+      context: ./missioncontrol-be
+    restart: unless-stopped
+    env_file:
+      - ./missioncontrol-be/.env
+    environment:
+      # Point Celery at the redis service (overrides .env / config defaults).
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      # Allow the public frontend origin through CORS.
+      CORS_ORIGINS: '["https://shipseo.reviewhandy.com"]'
+      FRONTEND_URL: https://shipseo.reviewhandy.com
+    expose:
+      - "8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    image: missioncontrol-backend:latest
+    build:
+      context: ./missioncontrol-be
+    restart: unless-stopped
+    env_file:
+      - ./missioncontrol-be/.env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FRONTEND_URL: https://shipseo.reviewhandy.com
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.celery_app.celery worker --loglevel=info
+
+  beat:
+    image: missioncontrol-backend:latest
+    build:
+      context: ./missioncontrol-be
+    restart: unless-stopped
+    env_file:
+      - ./missioncontrol-be/.env
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      FRONTEND_URL: https://shipseo.reviewhandy.com
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: celery -A app.celery_app.celery beat --loglevel=info
+
+  frontend:
+    image: missioncontrol-frontend:latest
+    build:
+      context: ./missioncontrol-fe
+      args:
+        # Baked into the bundle at build time. Point at the public API domain.
+        VITE_API_URL: https://api.shipseo.reviewhandy.com
+    restart: unless-stopped
+    expose:
+      - "80"
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:

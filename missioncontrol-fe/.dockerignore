@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.git
+.gitignore
+.DS_Store
+*.log
+CLAUDE.md
+README.md
+.env
+.env.*
