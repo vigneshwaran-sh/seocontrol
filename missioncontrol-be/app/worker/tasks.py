@@ -33,6 +33,11 @@ _PROVIDER_KEY_MAP = {
     "claude": "claude_api_key",
 }
 
+# Topic loop tuning
+TOPIC_APPROVAL_TARGET = 3   # approved topics needed before the batch task is Done
+TOPIC_MAX_REVISIONS = 5     # researcher↔validator rounds before escalating to admin
+DEFAULT_TOPIC_COUNT = 10    # topics proposed per round when none is given
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -316,6 +321,63 @@ def _clear_processing_flag(db, task_id: str):
     )
 
 
+def _due_reached(due_date) -> bool:
+    """
+    True if a task's due date has arrived (today or earlier), or if there is
+    no due date at all. Future due dates (e.g. tomorrow) return False so the
+    researcher waits until that day.
+    """
+    if not due_date:
+        return True
+    try:
+        if hasattr(due_date, "date"):
+            d = due_date.date()
+        else:
+            d = datetime.fromisoformat(str(due_date).replace("Z", "+00:00")).date()
+    except Exception:
+        return True
+    return d <= datetime.utcnow().date()
+
+
+def _parse_topic_count(text: str, default: int = DEFAULT_TOPIC_COUNT) -> int:
+    """Extract the requested number of topics from a task title/description."""
+    m = re.search(r"\b(\d{1,3})\b", text or "")
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 100:
+            return n
+    return default
+
+
+def _norm_title(s: str) -> str:
+    """Normalise a topic/title for exact-duplicate comparison."""
+    return re.sub(r"\s+", " ", (s or "").strip().lower()).rstrip(".!?")
+
+
+def _md_cell(text: str) -> str:
+    """Sanitise a value for a Markdown table cell (escape pipes / newlines)."""
+    return str(text or "").replace("|", "\\|").replace("\n", " ").strip()
+
+
+def _topics_md_table(topics: list[dict]) -> str:
+    """Render researcher topics as a | TOPIC | PURPOSE | Markdown table."""
+    lines = ["| TOPIC | PURPOSE |", "| --- | --- |"]
+    for t in topics:
+        lines.append(f"| {_md_cell(t.get('topic'))} | {_md_cell(t.get('purpose'))} |")
+    return "\n".join(lines)
+
+
+def _validation_md_table(rows: list[dict]) -> str:
+    """Render validator results as a | TOPIC | PURPOSE | STATUS | Remark | table."""
+    lines = ["| TOPIC | PURPOSE | STATUS | REMARK |", "| --- | --- | --- | --- |"]
+    for r in rows:
+        lines.append(
+            f"| {_md_cell(r.get('topic'))} | {_md_cell(r.get('purpose'))} "
+            f"| {_md_cell(r.get('status'))} | {_md_cell(r.get('remark'))} |"
+        )
+    return "\n".join(lines)
+
+
 
 def _parse_json_from_llm(text: str) -> dict | list:
     """
@@ -346,11 +408,17 @@ def _parse_json_from_llm(text: str) -> dict | list:
 # Beat task — daily cron for Content Researcher (all spaces)
 # ---------------------------------------------------------------------------
 
-@celery.task(name="run_content_researcher_all")
-def run_content_researcher_all():
+DAILY_TOPIC_TASK_TITLE = (
+    "Give me 10 new SEO blogs topic that attracts United States Restaurant Owners/Managers"
+)
+
+
+@celery.task(name="daily_cron")
+def daily_cron():
     """
-    Daily cron: for every space that has a configured Content Researcher
-    with provider/model set, run the researcher.
+    Daily cron (04:00 IST / 22:30 UTC): for every space with an active Content
+    Researcher, create a fresh topic-research task and assign it to that
+    researcher. The researcher picks it up immediately (no due date set).
     """
     db = get_sync_db()
     researchers = list(db.agents.find({
@@ -361,16 +429,34 @@ def run_content_researcher_all():
     }))
 
     if not researchers:
-        log.info("No active Content Researchers found.")
+        log.info("daily_cron: no active Content Researchers found.")
         return
 
+    created = 0
     for agent in researchers:
         space_id = agent["space_id"]
-        try:
-            run_content_researcher.delay(space_id)
-            log.info(f"Dispatched Content Researcher for space {space_id}")
-        except Exception as exc:
-            log.error(f"Failed to dispatch researcher for space {space_id}: {exc}")
+        researcher_id = str(agent["_id"])
+
+        todo_status = _get_status_by_name(db, space_id, "To Do")
+        if not todo_status:
+            log.warning(f"daily_cron: no 'To Do' status in space {space_id}, skipping.")
+            continue
+
+        new_task_id = _create_task(
+            db,
+            space_id=space_id,
+            title=DAILY_TOPIC_TASK_TITLE,
+            description="",
+            status_id=str(todo_status["_id"]),
+            assignee_id=researcher_id,
+            # Hold the lock so the periodic poll won't also dispatch it.
+            extra={"_agent_processing": True},
+        )
+        run_content_researcher.delay(new_task_id, space_id)
+        created += 1
+        log.info(f"daily_cron: created researcher task {new_task_id} in space {space_id}")
+
+    log.info(f"daily_cron: created {created} researcher task(s).")
 
 
 # ---------------------------------------------------------------------------
@@ -415,14 +501,21 @@ def poll_agent_tasks():
         # Determine which statuses trigger which roles
         todo_status = _get_status_by_name(db, space_id, "To Do")
         review_status = _get_status_by_name(db, space_id, "In Review")
+        is_todo = bool(todo_status) and status_id == str(todo_status["_id"])
+        is_review = bool(review_status) and status_id == str(review_status["_id"])
 
         should_dispatch = False
 
-        if role == ROLE_TOPIC_VALIDATOR and todo_status and status_id == str(todo_status["_id"]):
+        # Researcher works a topic task in To Do, but only once its due date
+        # has arrived (today/empty → now; tomorrow → waits).
+        if role == ROLE_RESEARCHER and is_todo and _due_reached(task.get("due_date")):
             should_dispatch = True
-        elif role == ROLE_CONTENT_WRITER and todo_status and status_id == str(todo_status["_id"]):
+        # Topic Validator reviews the researcher's topics from In Review.
+        elif role == ROLE_TOPIC_VALIDATOR and is_review:
             should_dispatch = True
-        elif role == ROLE_CONTENT_VALIDATOR and review_status and status_id == str(review_status["_id"]):
+        elif role == ROLE_CONTENT_WRITER and is_todo:
+            should_dispatch = True
+        elif role == ROLE_CONTENT_VALIDATOR and is_review:
             should_dispatch = True
 
         if not should_dispatch:
@@ -435,7 +528,9 @@ def poll_agent_tasks():
         )
 
         # Dispatch the right pipeline task
-        if role == ROLE_TOPIC_VALIDATOR:
+        if role == ROLE_RESEARCHER:
+            run_content_researcher.delay(task_id, space_id)
+        elif role == ROLE_TOPIC_VALIDATOR:
             run_topic_validator.delay(task_id, space_id)
         elif role == ROLE_CONTENT_WRITER:
             run_content_writer.delay(task_id, space_id)
@@ -453,143 +548,239 @@ def poll_agent_tasks():
 # ---------------------------------------------------------------------------
 
 @celery.task(name="run_content_researcher", bind=True, max_retries=2)
-def run_content_researcher(self, space_id: str):
+def run_content_researcher(self, task_id: str, space_id: str):
     """
-    Discover topics for the space's niche, then create a task
-    assigned to the Topic Validator with the list of topics.
-    Uses previous blog topics as context to avoid duplication.
+    Work a "topic ideas" task assigned to the Content Researcher.
+
+    Researches `topic + purpose` only, based on the agent's skills. Posts the
+    topics as a Markdown table in the comments, then moves the task to In Review
+    and assigns the Topic Validator.
+
+    Already-approved topics (from prior revisions) persist and are NOT
+    regenerated; this run produces fresh candidates that avoid those, the
+    previously-declined ones, and existing Notion blog titles.
     """
     db = get_sync_db()
-    now = datetime.utcnow
 
-    # Load researcher agent
+    task = db.tasks.find_one({"_id": ObjectId(task_id)})
+    if not task:
+        log.error(f"Task {task_id} not found")
+        return
+
     agent = _get_agent_by_role(db, space_id, ROLE_RESEARCHER)
     if not agent:
         log.warning(f"No active Content Researcher in space {space_id}")
+        _clear_processing_flag(db, task_id)
         return
 
     agent_id = str(agent["_id"])
     agent_name = agent.get("name", "Content Researcher")
 
-    # Load space config
     space = db.spaces.find_one({"_id": ObjectId(space_id)})
-    if not space:
-        log.error(f"Space {space_id} not found")
-        return
+    niche = (space or {}).get("niche", "")
 
-    niche = space.get("niche", "")
-    topic_count = space.get("topic_count", 5)
-
-    if not niche:
-        log.warning(f"Space {space_id} has no niche configured, skipping researcher.")
-        return
-
-    # ── Gather previous blog topics as context ──
-    # Pull titles from all existing tasks in this space (writer tasks)
-    writer = _get_agent_by_role(db, space_id, ROLE_CONTENT_WRITER)
-    previous_topics = []
-    if writer:
-        writer_id = str(writer["_id"])
-        past_tasks = list(
-            db.tasks.find(
-                {"space_id": space_id, "assignee_id": writer_id, "assignee_type": "agent"},
-                {"title": 1},
-            )
-            .sort("created_at", -1)
-            .limit(50)
-        )
-        previous_topics = [t["title"] for t in past_tasks if t.get("title")]
-
-    # Also check tasks assigned to validators (those were topic batches)
+    # Topic Validator must exist to hand off to.
     validator = _get_agent_by_role(db, space_id, ROLE_TOPIC_VALIDATOR)
-    if validator:
-        val_tasks = list(
-            db.tasks.find(
-                {"space_id": space_id, "assignee_id": str(validator["_id"]), "assignee_type": "agent"},
-                {"description": 1},
-            )
-            .sort("created_at", -1)
-            .limit(10)
+    if not validator:
+        _post_comment(db, task_id, agent_id, agent_name, "No Topic Validator agent found in this space.")
+        _clear_processing_flag(db, task_id)
+        return
+    validator_id = str(validator["_id"])
+    validator_name = validator.get("name", "Topic Validator")
+
+    # How many topics to propose this round.
+    topic_count = _parse_topic_count(
+        f"{task.get('title', '')} {task.get('description', '')}",
+        default=(space or {}).get("topic_count") or DEFAULT_TOPIC_COUNT,
+    )
+
+    # Move to In Progress while we work.
+    in_progress = _get_status_by_name(db, space_id, "In Progress")
+    if in_progress:
+        _move_task(db, task_id, str(in_progress["_id"]))
+
+    revision_count = task.get("_revision_count", 0)
+    approved_topics = task.get("_approved_topics", [])      # [{topic, purpose}]
+    declined_topics = task.get("_declined_topics", [])      # [{topic, purpose, remark}]
+    suggestions = task.get("_topic_suggestions", "")
+    needed = max(TOPIC_APPROVAL_TARGET - len(approved_topics), 0)
+
+    _post_comment(
+        db, task_id, agent_id, agent_name,
+        f"Researching {topic_count} topic ideas..."
+        + (f" (revision {revision_count}, {len(approved_topics)}/{TOPIC_APPROVAL_TARGET} approved so far)"
+           if revision_count else ""),
+    )
+
+    # ── Build the "do not repeat" list: existing Notion titles + approved + declined ──
+    org_settings = _get_org_settings(db, space_id)
+    notion_token, notion_database_id = _get_notion_config(org_settings)
+    existing_titles: list[str] = []
+    if notion_token and notion_database_id:
+        try:
+            from app.worker.notion import list_blog_titles
+            existing_titles = list_blog_titles(notion_token, notion_database_id)
+        except Exception as exc:
+            log.warning(f"Could not fetch existing Notion titles: {exc}")
+
+    avoid = list(existing_titles)
+    avoid += [t.get("topic", "") for t in approved_topics]
+    avoid += [t.get("topic", "") for t in declined_topics]
+    avoid = [a for a in dict.fromkeys(avoid) if a][:200]
+    avoid_block = ""
+    if avoid:
+        avoid_block = (
+            "\n\n## Do NOT repeat these existing/handled topics "
+            "(exact duplicates only — contextual overlap is fine):\n"
+            + "\n".join(f"- {a}" for a in avoid)
         )
-        for vt in val_tasks:
-            desc = vt.get("description", "")
-            # Extract topic titles from validator task descriptions
-            for line in desc.split("\n"):
-                line = line.strip().strip("-").strip("*").strip()
-                if line and len(line) > 10 and "title" not in line.lower()[:10]:
-                    previous_topics.append(line)
 
-    # Deduplicate
-    previous_topics = list(dict.fromkeys(previous_topics))[:50]
-
-    # Build previous topics context
-    previous_context = ""
-    if previous_topics:
-        topic_list = "\n".join(f"- {t}" for t in previous_topics)
-        previous_context = (
-            f"\n\n## Previously covered topics (DO NOT repeat these):\n{topic_list}\n"
-        )
-
-    # Call LLM
     system_extra = (
-        "You are a content research specialist. Your job is to discover trending, "
-        "engaging blog topics.\n\n"
-        "IMPORTANT: Respond ONLY with a valid JSON array of topic objects. No extra text.\n"
-        "Each topic object must have:\n"
-        '- "title": a compelling blog title\n'
-        '- "description": 2-3 sentence summary of what the blog should cover\n'
-        '- "category": the content category\n'
-        '- "focus_keyword": the primary SEO keyword\n'
+        "You are a content research specialist. Discover blog topic ideas based on your "
+        "instructions/skills above. For EACH idea provide only the topic and the purpose "
+        "of the blog — nothing else.\n\n"
+        "IMPORTANT: Respond ONLY with a valid JSON array. No extra text.\n"
+        "Each array item must be an object with exactly:\n"
+        '- "topic": a concise, compelling blog topic/title\n'
+        '- "purpose": one or two sentences on what the blog should achieve for the reader\n'
     )
 
-    user_prompt = (
-        f"Research and suggest {topic_count} NEW trending blog topics in the niche: \"{niche}\".\n\n"
-        f"The topics should be:\n"
-        f"- Fresh and trending (as of today)\n"
-        f"- SEO-friendly with clear search intent\n"
-        f"- Suitable for a detailed blog post (1500-2500 words)\n"
-        f"- Diverse within the niche\n"
-        f"- NOT duplicate or overlap with previously covered topics\n"
-        f"{previous_context}\n"
-        f"Return ONLY a JSON array with {topic_count} topic objects."
-    )
+    niche_line = f' in the niche "{niche}"' if niche else ""
 
+    existing_messages = task.get("_llm_messages_researcher", [])
+    use_cache = agent.get("provider") == "openai" and len(existing_messages) > 0
+
+    if use_cache and declined_topics:
+        # ── Revision turn (cached) — only append what changed ──
+        declined_block = "\n".join(
+            f"- {d.get('topic')} — declined: {d.get('remark', 'no remark')}"
+            for d in declined_topics
+        )
+        revision_prompt = (
+            f"The Topic Validator reviewed your previous topics. "
+            f"{len(approved_topics)} were approved and kept; {needed} more still need approval.\n\n"
+            f"## Declined topics (do not propose these again):\n{declined_block}\n\n"
+            + (f"## Overall suggestions from the validator:\n{suggestions}\n\n" if suggestions else "")
+            + f"Propose {topic_count} NEW topic ideas{niche_line} that address the feedback and "
+            f"avoid every topic already listed.{avoid_block}\n\n"
+            f"Return ONLY a JSON array of {topic_count} objects with \"topic\" and \"purpose\"."
+        )
+        messages = existing_messages + [{"role": "user", "content": revision_prompt}]
+    else:
+        system_prompt = _build_agent_system_prompt(agent, system_extra)
+        feedback_block = ""
+        if declined_topics:
+            declined_block = "\n".join(
+                f"- {d.get('topic')} — declined: {d.get('remark', 'no remark')}"
+                for d in declined_topics
+            )
+            feedback_block = f"\n\n## Previously declined (do not repeat):\n{declined_block}"
+            if suggestions:
+                feedback_block += f"\n\n## Validator suggestions:\n{suggestions}"
+        user_prompt = (
+            f"Suggest {topic_count} blog topic ideas{niche_line}. "
+            f"For each, give only the topic and its purpose. "
+            f"Make them distinct and aligned with your instructions."
+            f"{feedback_block}{avoid_block}\n\n"
+            f"Return ONLY a JSON array of {topic_count} objects with \"topic\" and \"purpose\"."
+        )
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    # ── Call LLM (cached thread persisted on the task) ──
     try:
-        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt, task_id="")
+        output, updated_messages = _call_agent_llm_cached(
+            db, agent, space_id, messages, task_id=task_id,
+        )
+        db.tasks.update_one(
+            {"_id": ObjectId(task_id)},
+            {"$set": {"_llm_messages_researcher": updated_messages}},
+        )
     except Exception as exc:
-        log.exception(f"Content Researcher LLM failed for space {space_id}: {exc}")
+        log.exception(f"Content Researcher LLM failed for task {task_id}: {exc}")
         try:
             self.retry(countdown=120)
         except self.MaxRetriesExceededError:
-            pass
+            _post_comment(db, task_id, agent_id, agent_name, f"Research failed: {str(exc)}")
+            _clear_processing_flag(db, task_id)
         return
 
-    # Find the Topic Validator to assign the task
-    validator = _get_agent_by_role(db, space_id, ROLE_TOPIC_VALIDATOR)
-    if not validator:
-        log.error(f"No Topic Validator in space {space_id}")
+    # Parse topics → [{topic, purpose}]
+    try:
+        parsed = _parse_json_from_llm(output)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("topics") or parsed.get("ideas") or [parsed]
+    except ValueError as exc:
+        _post_comment(db, task_id, agent_id, agent_name, f"Could not parse topics: {str(exc)}")
+        _clear_processing_flag(db, task_id)
         return
 
-    validator_id = str(validator["_id"])
-    todo_status = _get_status_by_name(db, space_id, "To Do")
-    if not todo_status:
-        log.error(f"No 'To Do' status in space {space_id}")
+    pending_topics = []
+    for item in parsed if isinstance(parsed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        topic = (item.get("topic") or item.get("title") or "").strip()
+        purpose = (item.get("purpose") or item.get("description") or "").strip()
+        if topic:
+            pending_topics.append({"topic": topic, "purpose": purpose})
+
+    # Hard de-duplication: drop any candidate whose title exactly matches an
+    # existing Notion blog or an already approved/declined topic. (Contextual
+    # overlap is allowed — only exact/near-exact titles are removed.)
+    avoid_norm = {_norm_title(a) for a in avoid}
+    seen_norm: set[str] = set()
+    deduped = []
+    dropped = 0
+    for t in pending_topics:
+        n = _norm_title(t["topic"])
+        if n in avoid_norm or n in seen_norm:
+            dropped += 1
+            continue
+        seen_norm.add(n)
+        deduped.append(t)
+    if dropped:
+        log.info(f"Researcher dropped {dropped} duplicate topic(s) for task {task_id}")
+    pending_topics = deduped[:topic_count]
+
+    if not pending_topics:
+        _post_comment(
+            db, task_id, agent_id, agent_name,
+            "All generated topics duplicated existing/handled topics. Will retry with fresh ideas.",
+        )
+        _clear_processing_flag(db, task_id)
         return
 
-    # Create task for Topic Validator
-    task_id = _create_task(
-        db,
-        space_id=space_id,
-        title=f"Validate topics for: {niche}",
-        description=f"Review and validate the following topics discovered by Content Researcher:\n\n{output}",
-        status_id=str(todo_status["_id"]),
-        assignee_id=validator_id,
+    # Persist this round's candidates for the validator to read.
+    db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {"_pending_topics": pending_topics}},
     )
 
-    log.info(f"Content Researcher created task {task_id} for Topic Validator in space {space_id}")
+    # Post the topics table and @mention the Topic Validator.
+    table = _topics_md_table(pending_topics)
+    _post_comment(
+        db, task_id, agent_id, agent_name,
+        f"@{validator_name} Researched {len(pending_topics)} topic idea(s) for validation:\n\n{table}",
+        mentions=[{"id": validator_id, "type": "agent", "name": validator_name}],
+    )
 
-    # Dispatch Topic Validator immediately
+    # Hand off to the Topic Validator: In Review + assign + keep the processing
+    # lock so poll won't double-dispatch, then trigger the validator directly.
+    review_status = _get_status_by_name(db, space_id, "In Review")
+    db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {
+            "assignee_id": validator_id,
+            "assignee_type": "agent",
+            "status_id": str(review_status["_id"]) if review_status else task.get("status_id"),
+            "_agent_processing": True,
+            "updated_at": datetime.utcnow(),
+        }},
+    )
     run_topic_validator.delay(task_id, space_id)
+    log.info(f"Content Researcher proposed {len(pending_topics)} topics for task {task_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -599,11 +790,21 @@ def run_content_researcher(self, space_id: str):
 @celery.task(name="run_topic_validator", bind=True, max_retries=2)
 def run_topic_validator(self, task_id: str, space_id: str):
     """
-    Validate topics and create individual Content Writer tasks
-    for each approved topic.
+    Validate the researcher's proposed topics (read from `_pending_topics`).
+
+    For every row: assign a status (approved/declined) and a remark, cross-
+    checking Notion to avoid exact duplicates (contextual overlap is fine).
+    Each approved topic immediately spawns a Content Writer task and is added
+    to the persistent `_approved_topics` set.
+
+    Completion rules:
+      • ≥ TOPIC_APPROVAL_TARGET approved (cumulative) → task → Done.
+      • otherwise → record declined topics + suggestions, send back to the
+        Content Researcher (To Do) for another round.
+      • after TOPIC_MAX_REVISIONS rounds without enough approvals → escalate
+        the task to an admin user.
     """
     db = get_sync_db()
-    now = datetime.utcnow
 
     task = db.tasks.find_one({"_id": ObjectId(task_id)})
     if not task:
@@ -619,6 +820,12 @@ def run_topic_validator(self, task_id: str, space_id: str):
     agent_id = str(agent["_id"])
     agent_name = agent.get("name", "Topic Validator")
 
+    pending_topics = task.get("_pending_topics", [])
+    if not pending_topics:
+        _post_comment(db, task_id, agent_id, agent_name, "No topics to validate.")
+        _clear_processing_flag(db, task_id)
+        return
+
     # Move to In Progress
     in_progress = _get_status_by_name(db, space_id, "In Progress")
     if in_progress:
@@ -626,29 +833,70 @@ def run_topic_validator(self, task_id: str, space_id: str):
 
     _post_comment(db, task_id, agent_id, agent_name, "Validating topics...")
 
-    # Call LLM
-    system_extra = (
-        "You are a content strategy validator. Review topics and shortlist the best ones.\n\n"
-        "IMPORTANT: Respond ONLY with a valid JSON array of approved topic objects.\n"
-        "Each approved topic must have:\n"
-        '- "title": the approved blog title (refined if needed)\n'
-        '- "description": refined 2-3 sentence description\n'
-        '- "category": content category\n'
-        '- "focus_keyword": primary SEO keyword\n'
-        '- "reason": brief reason why this topic was approved\n\n'
-        "Only include topics that are strong enough to publish. Remove weak or duplicate topics."
+    # ── Existing Notion titles for the duplicate cross-check ──
+    org_settings = _get_org_settings(db, space_id)
+    notion_token, notion_database_id = _get_notion_config(org_settings)
+    existing_titles: list[str] = []
+    if notion_token and notion_database_id:
+        try:
+            from app.worker.notion import list_blog_titles
+            existing_titles = list_blog_titles(notion_token, notion_database_id)
+        except Exception as exc:
+            log.warning(f"Could not fetch existing Notion titles: {exc}")
+    existing_block = ""
+    if existing_titles:
+        existing_block = (
+            "\n\n## Existing Notion blog titles (decline only EXACT/near-exact "
+            "duplicates — contextual overlap is acceptable):\n"
+            + "\n".join(f"- {t}" for t in existing_titles[:200])
+        )
+
+    topics_block = "\n".join(
+        f'{i + 1}. topic: "{t.get("topic")}" | purpose: "{t.get("purpose")}"'
+        for i, t in enumerate(pending_topics)
     )
 
-    task_description = task.get("description", "")
-    user_prompt = (
-        f"Review and validate these topics. Approve only the best ones:\n\n{task_description}"
+    system_extra = (
+        "You are a topic validator. Using your instructions/skills above, validate EACH "
+        "topic and its purpose, deciding whether it is worth writing a blog about.\n\n"
+        "IMPORTANT: Respond ONLY with valid JSON. No extra text. Shape:\n"
+        "{\n"
+        '  "rows": [\n'
+        '    {"topic": "...", "purpose": "...", "status": "approved" | "declined", "remark": "short reason"}\n'
+        "  ],\n"
+        '  "overall_suggestions": "guidance for the researcher if not enough were approved"\n'
+        "}\n\n"
+        "Return one row for EVERY topic given, preserving topic and purpose text. "
+        "Decline duplicates of existing blogs and weak/off-strategy ideas."
     )
+
+    existing_messages = task.get("_llm_messages_topic_validator", [])
+    use_cache = agent.get("provider") == "openai" and len(existing_messages) > 0
+
+    review_request = (
+        f"Validate these {len(pending_topics)} topics. Return one row per topic with "
+        f"status and remark.\n\n{topics_block}{existing_block}"
+    )
+    if use_cache:
+        messages = existing_messages + [{"role": "user", "content": review_request}]
+    else:
+        system_prompt = _build_agent_system_prompt(agent, system_extra)
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": review_request},
+        ]
 
     try:
-        output = _call_agent_llm(db, agent, space_id, system_extra, user_prompt, task_id=task_id)
+        output, updated_messages = _call_agent_llm_cached(
+            db, agent, space_id, messages, task_id=task_id,
+        )
+        db.tasks.update_one(
+            {"_id": ObjectId(task_id)},
+            {"$set": {"_llm_messages_topic_validator": updated_messages}},
+        )
     except Exception as exc:
         log.exception(f"Topic Validator LLM failed: {exc}")
-        _post_comment(db, task_id, agent_id, agent_name, f"Failed: {str(exc)}")
+        _post_comment(db, task_id, agent_id, agent_name, f"Validation failed: {str(exc)}")
         _clear_processing_flag(db, task_id)
         try:
             self.retry(countdown=60)
@@ -656,75 +904,210 @@ def run_topic_validator(self, task_id: str, space_id: str):
             pass
         return
 
-    # Parse approved topics
+    # ── Parse the validation result ──
     try:
-        approved_topics = _parse_json_from_llm(output)
-        if not isinstance(approved_topics, list):
-            approved_topics = [approved_topics]
+        parsed = _parse_json_from_llm(output)
     except ValueError as exc:
-        _post_comment(
-            db, task_id, agent_id, agent_name,
-            f"Could not parse validated topics: {str(exc)}",
-        )
+        _post_comment(db, task_id, agent_id, agent_name, f"Could not parse validation: {str(exc)}")
         _clear_processing_flag(db, task_id)
         return
 
-    # Find Content Writer
-    writer = _get_agent_by_role(db, space_id, ROLE_CONTENT_WRITER)
-    if not writer:
-        _post_comment(db, task_id, agent_id, agent_name, "No Content Writer agent found.")
+    if isinstance(parsed, dict):
+        rows = parsed.get("rows") or parsed.get("topics") or []
+        overall_suggestions = parsed.get("overall_suggestions", "") or parsed.get("suggestions", "")
+    elif isinstance(parsed, list):
+        rows = parsed
+        overall_suggestions = ""
+    else:
+        rows = []
+        overall_suggestions = ""
+
+    # Normalise rows; fall back to pending topic text when the model omits it.
+    norm_rows = []
+    for i, r in enumerate(rows):
+        if not isinstance(r, dict):
+            continue
+        fallback = pending_topics[i] if i < len(pending_topics) else {}
+        status_val = str(r.get("status", "")).strip().lower()
+        status_val = "approved" if status_val.startswith("appro") else "declined"
+        norm_rows.append({
+            "topic": (r.get("topic") or fallback.get("topic") or "").strip(),
+            "purpose": (r.get("purpose") or fallback.get("purpose") or "").strip(),
+            "status": status_val,
+            "remark": str(r.get("remark", "")).strip(),
+        })
+
+    if not norm_rows:
+        _post_comment(db, task_id, agent_id, agent_name, "Validator returned no rows. Will retry.")
         _clear_processing_flag(db, task_id)
         return
 
-    writer_id = str(writer["_id"])
-    todo_status = _get_status_by_name(db, space_id, "To Do")
-    if not todo_status:
-        _clear_processing_flag(db, task_id)
-        return
+    # Hard duplicate guard: regardless of the LLM's decision, force-decline any
+    # topic whose title exactly matches an existing Notion blog. This enforces
+    # the no-duplicate rule in code, not just via the prompt.
+    existing_norm = {_norm_title(t) for t in existing_titles}
+    forced = 0
+    if existing_norm:
+        for r in norm_rows:
+            if r["status"] == "approved" and _norm_title(r["topic"]) in existing_norm:
+                r["status"] = "declined"
+                r["remark"] = (r["remark"] + " " if r["remark"] else "") + \
+                    "(auto-declined: a blog with this title already exists in Notion)"
+                forced += 1
+    if forced:
+        log.info(f"Validator auto-declined {forced} Notion-duplicate topic(s) for task {task_id}")
 
-    # Create individual tasks for Content Writer
-    created_tasks = []
-    for topic in approved_topics:
-        title = topic.get("title", "Untitled Topic")
-        desc = topic.get("description", "")
-        category = topic.get("category", "")
-        keyword = topic.get("focus_keyword", "")
-
-        task_desc = (
-            f"Write a comprehensive blog post on this topic.\n\n"
-            f"**Title:** {title}\n"
-            f"**Description:** {desc}\n"
-            f"**Category:** {category}\n"
-            f"**Focus Keyword:** {keyword}\n"
-        )
-
-        new_task_id = _create_task(
-            db,
-            space_id=space_id,
-            title=title,
-            description=task_desc,
-            status_id=str(todo_status["_id"]),
-            assignee_id=writer_id,
-        )
-        created_tasks.append(title)
-
-        # Dispatch Content Writer immediately
-        run_content_writer.delay(new_task_id, space_id)
-
-    # Mark this validator task as Done
-    done_status = _get_status_by_name(db, space_id, "Done")
-    if done_status:
-        _move_task(db, task_id, str(done_status["_id"]))
-
+    # Post the validation table.
     _post_comment(
         db, task_id, agent_id, agent_name,
-        f"Validated and approved {len(created_tasks)} topic(s). "
-        f"Created tasks for Content Writer:\n" +
-        "\n".join(f"- {t}" for t in created_tasks),
+        f"Validation results:\n\n{_validation_md_table(norm_rows)}",
     )
 
-    _clear_processing_flag(db, task_id)
-    log.info(f"Topic Validator approved {len(created_tasks)} topics in space {space_id}")
+    approved_now = [r for r in norm_rows if r["status"] == "approved"]
+    declined_now = [r for r in norm_rows if r["status"] != "approved"]
+
+    # ── Spawn a Content Writer task for each newly approved topic ──
+    writer = _get_agent_by_role(db, space_id, ROLE_CONTENT_WRITER)
+    todo_status = _get_status_by_name(db, space_id, "To Do")
+    created = []
+    if writer and todo_status and approved_now:
+        writer_id = str(writer["_id"])
+        for r in approved_now:
+            new_task_id = _create_task(
+                db,
+                space_id=space_id,
+                title=r["topic"],
+                description=r["purpose"],
+                status_id=str(todo_status["_id"]),
+                assignee_id=writer_id,
+                extra={"_agent_processing": True},
+            )
+            created.append(r["topic"])
+            run_content_writer.delay(new_task_id, space_id)
+
+    # ── Update persistent state on the batch task ──
+    approved_topics = task.get("_approved_topics", [])
+    approved_topics += [{"topic": r["topic"], "purpose": r["purpose"]} for r in approved_now]
+    # Accumulate declined topics so the researcher avoids them next round.
+    declined_topics = task.get("_declined_topics", [])
+    declined_topics += [
+        {"topic": r["topic"], "purpose": r["purpose"], "remark": r["remark"]}
+        for r in declined_now
+    ]
+
+    db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {
+            "_approved_topics": approved_topics,
+            "_declined_topics": declined_topics,
+            "_topic_suggestions": overall_suggestions,
+        }, "$unset": {"_pending_topics": ""}},
+    )
+
+    total_approved = len(approved_topics)
+
+    if created:
+        _post_comment(
+            db, task_id, agent_id, agent_name,
+            f"Approved {len(created)} topic(s) this round ({total_approved}/{TOPIC_APPROVAL_TARGET} total). "
+            f"Created Content Writer task(s):\n" + "\n".join(f"- {t}" for t in created),
+        )
+
+    # ── Enough approved → Done ──
+    if total_approved >= TOPIC_APPROVAL_TARGET:
+        done_status = _get_status_by_name(db, space_id, "Done")
+        if done_status:
+            _move_task(db, task_id, str(done_status["_id"]))
+        _post_comment(
+            db, task_id, agent_id, agent_name,
+            f"Target reached — {total_approved} topic(s) approved and assigned to the Content Writer. "
+            f"Marking this task as Done.",
+        )
+        _clear_processing_flag(db, task_id)
+        log.info(f"Topic Validator completed task {task_id} with {total_approved} approved")
+        return
+
+    # ── Not enough yet → revision or escalation ──
+    revision_count = task.get("_revision_count", 0) + 1
+    db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {"_revision_count": revision_count}},
+    )
+
+    if revision_count >= TOPIC_MAX_REVISIONS:
+        admin = _find_admin_user(db)
+        admin_name = admin.get("full_name", "Admin") if admin else "Admin"
+        admin_id = str(admin["_id"]) if admin else None
+        _post_comment(
+            db, task_id, agent_id, agent_name,
+            f"@{admin_name} After {revision_count} revision rounds only {total_approved}/"
+            f"{TOPIC_APPROVAL_TARGET} topics were approved. Escalating for manual review.\n\n"
+            + (f"**Overall suggestions:** {overall_suggestions}" if overall_suggestions else ""),
+            mentions=[{"id": admin_id, "type": "user", "name": admin_name}] if admin_id else [],
+        )
+        todo_status = _get_status_by_name(db, space_id, "To Do")
+        if admin_id:
+            db.tasks.update_one(
+                {"_id": ObjectId(task_id)},
+                {"$set": {
+                    "assignee_id": admin_id,
+                    "assignee_type": "user",
+                    "status_id": str(todo_status["_id"]) if todo_status else task.get("status_id"),
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+        _clear_processing_flag(db, task_id)
+        log.info(f"Topic task {task_id} escalated to admin after {revision_count} rounds")
+        return
+
+    # Send back to the Content Researcher for another round.
+    researcher = _get_agent_by_role(db, space_id, ROLE_RESEARCHER)
+    if not researcher:
+        _post_comment(db, task_id, agent_id, agent_name, "No Content Researcher to send back to.")
+        _clear_processing_flag(db, task_id)
+        return
+
+    researcher_id = str(researcher["_id"])
+    researcher_name = researcher.get("name", "Content Researcher")
+    needed = TOPIC_APPROVAL_TARGET - total_approved
+
+    feedback_parts = [
+        f"@{researcher_name} {total_approved}/{TOPIC_APPROVAL_TARGET} topics approved — "
+        f"need {needed} more. Round {revision_count}/{TOPIC_MAX_REVISIONS}.",
+    ]
+    if declined_now:
+        feedback_parts.append("")
+        feedback_parts.append("**Declined this round:**")
+        for r in declined_now:
+            feedback_parts.append(f"- {r['topic']} — {r['remark']}")
+    if overall_suggestions:
+        feedback_parts.append("")
+        feedback_parts.append(f"**Overall suggestions:** {overall_suggestions}")
+
+    todo_status = _get_status_by_name(db, space_id, "To Do")
+    # Reassign to researcher, move to To Do, keep the processing lock and
+    # dispatch directly so the next round starts immediately (revisions ignore
+    # the due date — only the initial trigger waits for it).
+    db.tasks.update_one(
+        {"_id": ObjectId(task_id)},
+        {"$set": {
+            "assignee_id": researcher_id,
+            "assignee_type": "agent",
+            "status_id": str(todo_status["_id"]) if todo_status else task.get("status_id"),
+            "_agent_processing": True,
+            "updated_at": datetime.utcnow(),
+        }},
+    )
+    _post_comment(
+        db, task_id, agent_id, agent_name,
+        "\n".join(feedback_parts),
+        mentions=[{"id": researcher_id, "type": "agent", "name": researcher_name}],
+    )
+    run_content_researcher.delay(task_id, space_id)
+    log.info(
+        f"Topic Validator sent task {task_id} back to researcher "
+        f"(round {revision_count}, {total_approved} approved)"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1214,7 +1597,9 @@ def run_content_validator(self, task_id: str, space_id: str):
     if approved:
         # Generate thumbnail SVG, upload to Notion page, then clean up
         from app.worker.thumbnail import generate_thumbnail, delete_thumbnail
-        from app.worker.notion import upload_image_to_page
+        from app.worker.notion import (
+            upload_image_to_page, get_first_image_url, set_thumbnail_url,
+        )
 
         try:
             svg_path = generate_thumbnail(blog_title)
@@ -1226,6 +1611,20 @@ def run_content_validator(self, task_id: str, space_id: str):
             log.info(f"Thumbnail uploaded and local file deleted for task {task_id}")
         except Exception as exc:
             log.warning(f"Thumbnail generation/upload failed for task {task_id}: {exc}")
+            # Non-fatal — continue with publishing
+
+        # Copy the first image on the page (the thumbnail we just uploaded sits
+        # at the top) into the database's `thumbnail_url` property — before the
+        # status is flipped to Published.
+        try:
+            first_image_url = get_first_image_url(notion_token, notion_page_id)
+            if first_image_url:
+                set_thumbnail_url(notion_token, notion_page_id, first_image_url)
+                log.info(f"Set thumbnail_url for task {task_id}: {first_image_url}")
+            else:
+                log.warning(f"No image found on page for task {task_id}; thumbnail_url not set")
+        except Exception as exc:
+            log.warning(f"Could not set thumbnail_url for task {task_id}: {exc}")
             # Non-fatal — continue with publishing
 
         # Update Notion status to Published

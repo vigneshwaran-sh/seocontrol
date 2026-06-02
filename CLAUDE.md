@@ -23,8 +23,8 @@ Organization → Spaces → (Tasks, Documents/Folders, Agents)
 ### Content pipeline (the core feature)
 Four fixed pipeline agents are auto-created when a Space is made. They execute in sequence as Celery tasks:
 
-1. **Content Researcher** (`content_researcher`) — runs on daily cron; queries LLM for topic ideas; creates a task assigned to Topic Validator
-2. **Topic Validator** (`topic_validator`) — validates/shortlists topics; creates individual tasks for Content Writer
+1. **Content Researcher** (`content_researcher`) — triggered when a "Give me N topic ideas" task is assigned to it, **on a due-date basis** (today/empty → now, future → waits). Researches topic + purpose only (count parsed from the title), posts a `| TOPIC | PURPOSE |` table in comments, then moves the task to In Review and assigns the Topic Validator.
+2. **Topic Validator** (`topic_validator`) — reads the researcher's topics; validates every row (approved/declined + remark) in a `| TOPIC | PURPOSE | STATUS | REMARK |` table, cross-checking Notion for duplicates. Each approved topic immediately spawns a Content Writer task. Loops back to the researcher (the same batch task) until **3 topics are approved cumulatively** (→ Done) or **5 rounds** elapse (→ escalate to admin). Approved topics persist across rounds; only the shortfall is regenerated.
 3. **Content Writer** (`content_writer`) — writes blog post JSON via LLM; publishes to Notion as a Draft; moves to In Review
 4. **Content Validator** (`content_validator`) — reads content from Notion; approves (→ Published + thumbnail) or rejects (→ back to writer). After 5 revision cycles, escalates to admin user.
 
@@ -33,21 +33,23 @@ Pipeline dispatch happens in two ways:
 - **Immediate**: When a task is created or its assignee changes to an agent via the API, it dispatches directly
 
 ### Key Celery beat schedules
-- `poll_agent_tasks` — every `AGENT_POLL_INTERVAL_SECONDS` (default: 30s)
-- `run_content_researcher_all` — daily cron at `RESEARCHER_CRON_HOUR:RESEARCHER_CRON_MINUTE` UTC
+- `poll_agent_tasks` — every `AGENT_POLL_INTERVAL_SECONDS` (default: 30s). Also the backstop that fires the researcher when a deferred (future due-date) task becomes due.
+- `daily_cron` — daily at `DAILY_CRON_HOUR:DAILY_CRON_MINUTE` UTC (default **22:30 UTC = 04:00 IST**). Creates the static daily topic task ("Give me 10 new SEO blogs topic that attracts United States Restaurant Owners/Managers") in every space with an active Content Researcher and assigns it to that researcher.
 
 ### LLM provider support
 - **OpenAI**, **Gemini**, **Claude** — configured per agent
 - API keys stored in `org_settings` collection per org
-- OpenAI gets a special cached path (`execute_with_llm_cached`) for the writer/validator revision loop: conversation history is persisted on the task doc (`_llm_messages_writer`, `_llm_messages_validator`) and replayed to benefit from OpenAI prefix caching
+- All four agents use the cached path (`execute_with_llm_cached`): each task keeps a persisted conversation thread (`_llm_messages_researcher`, `_llm_messages_topic_validator`, `_llm_messages_writer`, `_llm_messages_validator`) so the full request/response is logged per task and (on OpenAI) the prefix is served from prompt cache across revisions
 
 ### MongoDB collections
 `users`, `organizations`, `spaces`, `tasks`, `task_statuses`, `agents`, `comments`, `llm_logs`, `org_settings`
 
 ### Task internal fields (underscore-prefixed, not in API response)
-- `_agent_processing` — lock flag; prevents duplicate Celery dispatches
-- `_revision_count` — number of writer/validator revision rounds
-- `_llm_messages_writer` / `_llm_messages_validator` — conversation history arrays for OpenAI caching
+- `_agent_processing` — lock flag; prevents duplicate Celery dispatches. Held `True` for the whole researcher↔validator loop (each stage hands off directly); cleared only on a terminal state
+- `_revision_count` — number of revision rounds (writer/validator loop AND researcher/validator topic loop)
+- `_llm_messages_researcher` / `_llm_messages_topic_validator` / `_llm_messages_writer` / `_llm_messages_validator` — per-task conversation threads (logged + OpenAI caching)
+- `_pending_topics` — topics the researcher proposed this round, awaiting validation (unset after the validator reads them)
+- `_approved_topics` / `_declined_topics` — persistent topic state across revisions; `_topic_suggestions` — validator's overall guidance for the next researcher round
 - `notion_page_id` — Notion page ID stored once the writer publishes
 
 ### Default task statuses per space

@@ -23,10 +23,22 @@
 #   docker compose logs -f proxy        # watch routing logs
 #   docker compose down                 # stop + remove
 
+# Bound every container's stdout/stderr (the `docker compose logs` stream) so
+# it can never grow without limit. This is the size-based backstop; true daily
+# rotation of the app/worker/beat logs is handled in-process (see LOG_DIR + the
+# rotating logs volume below), and the agent LLM logs auto-expire via a MongoDB
+# TTL index.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "1"
+
 services:
   proxy:
     image: nginx:alpine
     restart: unless-stopped
+    logging: *default-logging
     ports:
       - "80:80"
     volumes:
@@ -38,6 +50,7 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *default-logging
     volumes:
       - redis_data:/data
     healthcheck:
@@ -51,6 +64,7 @@ services:
     build:
       context: ./missioncontrol-be
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - ./missioncontrol-be/.env
     environment:
@@ -60,6 +74,11 @@ services:
       # Allow the public frontend origin through CORS.
       CORS_ORIGINS: '["https://shipseo.reviewhandy.com"]'
       FRONTEND_URL: https://shipseo.reviewhandy.com
+      # Daily-rotating process logs (kept ≤ 1 day) written here.
+      SERVICE_NAME: backend
+      LOG_DIR: /var/log/missioncontrol
+    volumes:
+      - app_logs:/var/log/missioncontrol
     expose:
       - "8000"
     depends_on:
@@ -72,12 +91,17 @@ services:
     build:
       context: ./missioncontrol-be
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - ./missioncontrol-be/.env
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       FRONTEND_URL: https://shipseo.reviewhandy.com
+      SERVICE_NAME: worker
+      LOG_DIR: /var/log/missioncontrol
+    volumes:
+      - app_logs:/var/log/missioncontrol
     depends_on:
       redis:
         condition: service_healthy
@@ -88,12 +112,17 @@ services:
     build:
       context: ./missioncontrol-be
     restart: unless-stopped
+    logging: *default-logging
     env_file:
       - ./missioncontrol-be/.env
     environment:
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       FRONTEND_URL: https://shipseo.reviewhandy.com
+      SERVICE_NAME: beat
+      LOG_DIR: /var/log/missioncontrol
+    volumes:
+      - app_logs:/var/log/missioncontrol
     depends_on:
       redis:
         condition: service_healthy
@@ -107,6 +136,7 @@ services:
         # Baked into the bundle at build time. Point at the public API domain.
         VITE_API_URL: https://api-shipseo.reviewhandy.com
     restart: unless-stopped
+    logging: *default-logging
     expose:
       - "80"
     depends_on:
@@ -114,3 +144,4 @@ services:
 
 volumes:
   redis_data:
+  app_logs:

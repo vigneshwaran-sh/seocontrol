@@ -47,7 +47,7 @@ def _build_svg(title: str) -> str:
 
     line_height = 72
     total_text_height = line_count * line_height
-    start_y = 260 - (total_text_height / 2) + line_height / 2 + 20
+    start_y = 260 - (total_text_height / 2) + line_height / 2 + 120
 
     tspan_elements = []
     for idx, line in enumerate(lines):
@@ -58,7 +58,7 @@ def _build_svg(title: str) -> str:
 
     tspans = "\n".join(tspan_elements)
 
-    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 600" width="1200" height="600">
+    svg = f"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800">
   <defs>
     <linearGradient id="borderGradient" x1="0%" y1="0%" x2="100%" y2="100%">
       <stop offset="0%" style="stop-color:#010729;stop-opacity:1" />
@@ -72,9 +72,9 @@ def _build_svg(title: str) -> str:
     </linearGradient>
   </defs>
 
-  <rect width="1200" height="600" fill="#FFF"/>
-  <rect x="0" y="0" width="1200" height="600" fill="url(#borderGradient)"/>
-  <rect x="45" y="45" width="1110" height="510" fill="#FFF" rx="15"/>
+  <rect width="1200" height="800" fill="#FFF"/>
+  <rect x="0" y="0" width="1200" height="800" fill="url(#borderGradient)"/>
+  <rect x="45" y="45" width="1110" height="710" fill="#FFF" rx="15"/>
 
   <text
     x="600"
@@ -88,11 +88,11 @@ def _build_svg(title: str) -> str:
 {tspans}
   </text>
 
-  <line x1="110" y1="475" x2="1090" y2="475" stroke="#dbe2ec" stroke-width="3"/>
+  <line x1="110" y1="575" x2="1090" y2="575" stroke="#dbe2ec" stroke-width="3"/>
 
   <text
     x="600"
-    y="520"
+    y="620"
     text-anchor="middle"
     font-family="Montserrat, Arial, Helvetica, sans-serif"
     font-size="22"

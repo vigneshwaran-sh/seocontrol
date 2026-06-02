@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 .env
 *.log
+logs/
 *.pid
 celerybeat-schedule*
 assets/*.svg

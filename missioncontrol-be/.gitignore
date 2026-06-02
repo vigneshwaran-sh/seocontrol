@@ -57,3 +57,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# rotating process logs
+logs/

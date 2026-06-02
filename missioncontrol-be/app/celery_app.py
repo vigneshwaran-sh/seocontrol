@@ -1,7 +1,21 @@
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import setup_logging as _setup_logging_signal
 
 from app.config import settings
+
+
+@_setup_logging_signal.connect
+def _configure_celery_logging(**_kwargs):
+    """Use our daily-rotating logging instead of Celery's default config.
+
+    Connecting to this signal tells Celery NOT to configure logging itself, so
+    the handlers we install (file rotation + console) are the only ones used by
+    both the worker and beat processes.
+    """
+    from app.logging_config import setup_logging
+    setup_logging()
+
 
 celery = Celery(
     "missioncontrol",
@@ -21,11 +35,11 @@ celery.conf.update(
             "task": "poll_agent_tasks",
             "schedule": settings.AGENT_POLL_INTERVAL_SECONDS,
         },
-        "daily-content-researcher": {
-            "task": "run_content_researcher_all",
+        "daily-cron": {
+            "task": "daily_cron",
             "schedule": crontab(
-                hour=settings.RESEARCHER_CRON_HOUR,
-                minute=settings.RESEARCHER_CRON_MINUTE,
+                hour=settings.DAILY_CRON_HOUR,
+                minute=settings.DAILY_CRON_MINUTE,
             ),
         },
     },

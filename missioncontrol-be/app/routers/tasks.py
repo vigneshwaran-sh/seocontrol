@@ -53,9 +53,26 @@ async def _maybe_dispatch_agent_task(
             run_content_validator.delay(task_id, space_id)
             log.info(f"Dispatched Content Validator for task {task_id}")
         elif role == "content_researcher":
-            from app.worker.tasks import run_content_researcher
-            run_content_researcher.delay(space_id)
-            log.info(f"Dispatched Content Researcher for space {space_id}")
+            # Researcher works the task on a due-date basis: today/empty → now,
+            # a future due date → wait (the periodic poll dispatches it that day).
+            task_doc = await db.tasks.find_one({"_id": ObjectId(task_id)})
+            due_date = (task_doc or {}).get("due_date")
+            due_now = True
+            if due_date:
+                try:
+                    due_now = due_date.date() <= datetime.utcnow().date()
+                except Exception:
+                    due_now = True
+            if due_now:
+                await db.tasks.update_one(
+                    {"_id": ObjectId(task_id)},
+                    {"$set": {"_agent_processing": True}},
+                )
+                from app.worker.tasks import run_content_researcher
+                run_content_researcher.delay(task_id, space_id)
+                log.info(f"Dispatched Content Researcher for task {task_id}")
+            else:
+                log.info(f"Researcher task {task_id} deferred until due date {due_date}")
         else:
             log.warning(f"Agent {assignee_id} has unknown role '{role}', skipping.")
     except Exception as exc:

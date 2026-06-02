@@ -52,7 +52,7 @@ def _make_slug(name: str) -> str:
     return slug
 
 
-@router.post("/", response_model=SpaceResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=SpaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_space(org_id: str, body: SpaceCreate, user: dict = Depends(get_current_user)):
     db = get_db()
     if not ObjectId.is_valid(org_id):
@@ -119,7 +119,7 @@ async def create_space(org_id: str, body: SpaceCreate, user: dict = Depends(get_
     return serialize_space(doc)
 
 
-@router.get("/", response_model=list[SpaceResponse])
+@router.get("", response_model=list[SpaceResponse])
 async def list_spaces(org_id: str, user: dict = Depends(get_current_user)):
     db = get_db()
     if not ObjectId.is_valid(org_id):

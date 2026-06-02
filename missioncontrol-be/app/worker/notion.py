@@ -161,6 +161,73 @@ def update_blog_content(
     log.info(f"Updated Notion page {page_id} content")
 
 
+def list_blog_titles(token: str, database_id: str, limit: int = 200) -> list[str]:
+    """
+    Return the titles of existing entries in the Notion Blogs database.
+
+    Works under the new Notion data-source API model (version 2025-09-03+):
+    a database holds one or more data sources, and rows are queried per data
+    source (`/v1/data_sources/{id}/query`). Falls back to the legacy
+    `/v1/databases/{id}/query` for older single-source databases.
+
+    Best-effort — raises nothing; returns whatever it could collect.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Notion-Version": NOTION_VERSION,
+        "Content-Type": "application/json",
+    }
+    db_norm = _normalize_id(database_id)
+    titles: list[str] = []
+
+    def _collect(query_url: str) -> None:
+        cursor = None
+        while len(titles) < limit:
+            body: dict = {"page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            r = httpx.post(query_url, headers=headers, json=body)
+            r.raise_for_status()
+            data = r.json()
+            for row in data.get("results", []):
+                for val in row.get("properties", {}).values():
+                    if val.get("type") == "title":
+                        text = _extract_rich_text(val.get("title", []))
+                        if text:
+                            titles.append(text)
+                        break
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
+
+    # Resolve the database's data sources (new model). Single-source / legacy
+    # databases return no `data_sources` array, so we fall back to the old path.
+    data_source_ids: list[str] = []
+    try:
+        dbresp = httpx.get(f"{NOTION_API}/databases/{db_norm}", headers=headers)
+        dbresp.raise_for_status()
+        for ds in dbresp.json().get("data_sources", []) or []:
+            if ds.get("id"):
+                data_source_ids.append(ds["id"])
+    except Exception as exc:
+        log.warning(f"Could not retrieve Notion database {database_id}: {exc}")
+
+    if data_source_ids:
+        for ds_id in data_source_ids:
+            try:
+                _collect(f"{NOTION_API}/data_sources/{_normalize_id(ds_id)}/query")
+            except Exception as exc:
+                log.warning(f"Notion data-source query failed for {ds_id}: {exc}")
+    else:
+        try:
+            _collect(f"{NOTION_API}/databases/{db_norm}/query")
+        except Exception as exc:
+            log.warning(f"Notion database query failed for {database_id}: {exc}")
+
+    log.info(f"Fetched {len(titles)} existing Notion blog title(s) for dedup")
+    return titles[:limit]
+
+
 def read_page_content(token: str, page_id: str) -> str:
     """
     Read all text content from a Notion page.
@@ -266,6 +333,45 @@ def upload_image_to_page(token: str, page_id: str, file_path: str) -> dict:
 
     log.info(f"Uploaded image {path.name} to Notion page {page_id} (at top)")
     return {"file_upload_id": file_upload_id, "page_id": page_id}
+
+
+def get_first_image_url(token: str, page_id: str) -> str | None:
+    """
+    Return the URL of the first image block on a Notion page (top to bottom),
+    or None if the page has no image. Handles uploaded files (`file`),
+    external images (`external`), and unresolved `file_upload` blocks.
+    """
+    notion = Client(auth=token)
+    cursor = None
+    while True:
+        kwargs = {"block_id": _normalize_id(page_id)}
+        if cursor:
+            kwargs["start_cursor"] = cursor
+        response = notion.blocks.children.list(**kwargs)
+        for block in response.get("results", []):
+            if block.get("type") != "image":
+                continue
+            img = block.get("image", {})
+            itype = img.get("type")
+            url = (img.get(itype) or {}).get("url") if itype else None
+            if url:
+                return url
+        if not response.get("has_more"):
+            break
+        cursor = response.get("next_cursor")
+    return None
+
+
+def set_thumbnail_url(token: str, page_id: str, url: str) -> None:
+    """
+    Set the `thumbnail_url` property on a Notion blog page (a URL-type column).
+    """
+    notion = Client(auth=token)
+    notion.pages.update(
+        page_id=page_id,
+        properties={"thumbnail_url": {"url": url}},
+    )
+    log.info(f"Set thumbnail_url on Notion page {page_id}")
 
 
 def get_page_id_by_slug(token: str, database_id: str, slug: str) -> str | None:

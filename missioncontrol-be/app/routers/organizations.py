@@ -18,7 +18,7 @@ def _make_slug(name: str) -> str:
     return slug
 
 
-@router.post("/", response_model=OrgResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=OrgResponse, status_code=status.HTTP_201_CREATED)
 async def create_org(body: OrgCreate, user: dict = Depends(get_current_user)):
     db = get_db()
     slug = _make_slug(body.name)
@@ -43,7 +43,7 @@ async def create_org(body: OrgCreate, user: dict = Depends(get_current_user)):
     return serialize_org(doc)
 
 
-@router.get("/", response_model=list[OrgResponse])
+@router.get("", response_model=list[OrgResponse])
 async def list_orgs(user: dict = Depends(get_current_user)):
     db = get_db()
     orgs = await db.organizations.find().sort("created_at", 1).to_list(length=100)

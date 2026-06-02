@@ -21,29 +21,34 @@ Celery task package for the 4-stage AI content pipeline. All code here is **sync
 **`poll_agent_tasks`** — periodic (every `AGENT_POLL_INTERVAL_SECONDS`):
 - Finds all tasks with `assignee_type: "agent"` that are not already `_agent_processing`
 - Checks the agent role + current task status to determine if a dispatch is needed
-- Topic Validator + Content Writer trigger on `To Do` status
-- Content Validator triggers on `In Review` status
+- Content Researcher triggers on `To Do` **only once the task's due date has arrived** (`_due_reached`: today/empty → now, future → waits)
+- Content Writer triggers on `To Do` status
+- Topic Validator + Content Validator trigger on `In Review` status (distinguished by role)
 - Sets `_agent_processing: True` before dispatching
 
-**`run_content_researcher_all`** — daily cron:
-- Finds all active Content Researcher agents with provider/model set
-- Dispatches `run_content_researcher.delay(space_id)` for each
+**`daily_cron`** — daily at `DAILY_CRON_HOUR:DAILY_CRON_MINUTE` UTC (default 22:30 UTC = 04:00 IST). For every space with an active Content Researcher, creates a fresh task titled `DAILY_TOPIC_TASK_TITLE` ("Give me 10 new SEO blogs topic that attracts United States Restaurant Owners/Managers") in To Do, assigns the researcher (with the `_agent_processing` lock held), and dispatches it directly. The researcher is otherwise task-triggered — assign it any "Give me N topic ideas" task manually too.
 
 ## Pipeline Task Sequence
 
-### Step 1: `run_content_researcher(space_id)`
-- Fetches space `niche` and `topic_count` config
-- Builds a previous-topics context from the last 50 writer tasks and last 10 validator task descriptions
-- Calls LLM via `_call_agent_llm()` (one-shot); expects JSON array of `{title, description, category, focus_keyword}`
-- Creates a task assigned to the Topic Validator with the raw LLM output as description
-- Dispatches `run_topic_validator.delay()` immediately
+The Content Researcher ↔ Topic Validator pair operate as a **loop on a single batch task** (e.g. "Give me 10 topic ideas"). The task itself is never the blog — approved topics spawn *separate* Content Writer tasks. The loop continues until `TOPIC_APPROVAL_TARGET` (3) topics are approved cumulatively, or `TOPIC_MAX_REVISIONS` (5) rounds elapse (→ escalate to admin).
+
+Throughout the loop `_agent_processing` stays `True` and each stage directly `.delay()`s the next, so poll never double-dispatches; it is cleared only on a terminal state (Done / admin escalation / error).
+
+### Step 1: `run_content_researcher(task_id, space_id)`
+- Triggered when a task is assigned to the researcher; the count is parsed from the task title/description (`_parse_topic_count`, default 10)
+- Researches **topic + purpose only**, based on the agent's skills; builds a "do not repeat" list from existing Notion titles (`list_blog_titles`) + this task's `_approved_topics` + `_declined_topics`
+- Uses the cached LLM thread `_llm_messages_researcher` (revisions append only the declined topics + validator suggestions)
+- Stores candidates on `_pending_topics`, posts a `| TOPIC | PURPOSE |` Markdown table @mentioning the Topic Validator
+- Moves the task to In Review, assigns the Topic Validator, dispatches `run_topic_validator.delay()`
 
 ### Step 2: `run_topic_validator(task_id, space_id)`
-- Moves task to In Progress, posts a comment
-- Calls LLM to shortlist/refine topics; parses approved topics from JSON
-- Creates individual tasks for each approved topic, assigned to Content Writer
-- Dispatches `run_content_writer.delay()` for each immediately
-- Marks the validator task as Done
+- Reads `_pending_topics`; validates EVERY row (approved/declined + remark), cross-checking existing Notion titles for duplicates (contextual overlap is fine)
+- Uses the cached LLM thread `_llm_messages_topic_validator`; expects `{rows: [{topic, purpose, status, remark}], overall_suggestions}`
+- Posts a `| TOPIC | PURPOSE | STATUS | REMARK |` table
+- For each **approved** topic: immediately creates a Content Writer task (title = topic, description = purpose) and dispatches `run_content_writer.delay()`; appends to `_approved_topics`
+- Appends declined topics to `_declined_topics` and stores `_topic_suggestions`
+- **≥ 3 approved cumulatively** → task → Done. Otherwise increments `_revision_count`, reassigns the researcher (To Do), dispatches `run_content_researcher.delay()`. **After 5 rounds** → assign to admin user.
+- Already-approved topics persist across rounds (not re-validated); the researcher only regenerates the shortfall
 
 ### Step 3: `run_content_writer(task_id, space_id)`
 Three paths based on whether this is a first write or a revision, and whether caching is active:
@@ -58,7 +63,7 @@ Publishes to Notion via `create_blog_entry()` (first write) or `update_blog_cont
 ### Step 4: `run_content_validator(task_id, space_id)`
 Two paths (same caching pattern as writer, stored in `_llm_messages_validator`):
 - Reads current Notion page content/properties every time (content changes each revision)
-- If **approved**: generates thumbnail SVG → uploads to Notion → deletes local file → updates Notion status to Published → moves task to Done → notifies admin
+- If **approved**: generates thumbnail SVG → uploads to Notion (image block at the top) → deletes local file → copies the page's **first image URL** into the database's `thumbnail_url` property (`get_first_image_url` + `set_thumbnail_url`, before publishing) → updates Notion status to Published → moves task to Done → notifies admin
 - If **rejected**: increments `_revision_count`; posts structured feedback comment @mentioning the writer; reassigns to writer, moves to To Do
 - After 5 rejection rounds: escalates to admin user (reassigns task to admin, posts @mention comment, stops the loop)
 
@@ -68,8 +73,11 @@ Two paths (same caching pattern as writer, stored in `_llm_messages_validator`):
 - `_get_status_by_name(db, space_id, name)` — case-insensitive lookup of task status; these lookups drive all pipeline routing
 - `_get_org_settings(db, space_id)` — resolves org via space's `org_id`, returns the `org_settings` doc
 - `_get_api_key(org_settings, provider)` — extracts the right key field from org_settings
-- `_call_agent_llm(db, agent, space_id, system_extra, user_prompt)` — one-shot LLM call for researcher and validator
-- `_call_agent_llm_cached(db, agent, space_id, messages)` — multi-turn call; returns `(response_text, updated_messages)`
+- `_call_agent_llm(db, agent, space_id, system_extra, user_prompt)` — one-shot LLM call (utility; **currently unused** — all four agents now use the cached path so their request/response threads are logged per task)
+- `_call_agent_llm_cached(db, agent, space_id, messages)` — multi-turn call used by all agents; returns `(response_text, updated_messages)`. Threads persisted per task: `_llm_messages_researcher`, `_llm_messages_topic_validator`, `_llm_messages_writer`, `_llm_messages_validator`
+- `_due_reached(due_date)` — True if today/empty, False for a future due date (gates the researcher trigger)
+- `_parse_topic_count(text, default)` — pulls the requested topic count from the task title/description
+- `_topics_md_table(...)` / `_validation_md_table(...)` — render the researcher/validator comment tables
 - `_post_comment(db, task_id, agent_id, agent_name, content, mentions)` — inserts a comment on behalf of an agent
 - `_create_task(...)` — inserts a task, auto-positions at end of the status column
 - `_parse_json_from_llm(text)` — extracts JSON from LLM output; handles ````json` code blocks and raw JSON

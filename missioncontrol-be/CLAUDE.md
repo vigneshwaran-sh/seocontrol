@@ -76,6 +76,11 @@ Before dispatching, the task document gets `_agent_processing: True` set to prev
 ### LLM logging
 Every LLM call is logged to the `llm_logs` collection directly inside `app/worker/llm.py` at the point of the API call. The logged `request` is the exact `**kwargs` dict sent to the provider SDK; `response` is raw text. Stored fields: `task_id`, `agent_id`, `space_id`, `provider`, `model`, `request` (dict), `response`, `duration_ms`, `requested_at`, `created_at`.
 
+### Logging & retention (all ≤ 1 day)
+- **Agent/LLM logs** (`llm_logs`): a **TTL index** on `created_at` (`LLM_LOG_TTL_SECONDS`, default 86400) is ensured in `main.py`'s lifespan; MongoDB auto-deletes entries older than 1 day.
+- **Process logs** (backend / worker / beat): `app/logging_config.py` `setup_logging()` installs a `TimedRotatingFileHandler` (midnight UTC, `backupCount=LOG_BACKUP_DAYS=1`) writing to `${LOG_DIR}/${SERVICE_NAME}.log` plus a console handler. Wired into Celery via the `setup_logging` signal in `celery_app.py` and called at import in `main.py`. In Docker, `LOG_DIR=/var/log/missioncontrol` on a shared `app_logs` volume; each service sets a distinct `SERVICE_NAME`.
+- **Container stdout**: the `x-logging` anchor in docker-compose caps every service's `json-file` driver (`max-size 10m`, `max-file 1`) as a size backstop.
+
 ### Thumbnail generation
 `app/worker/thumbnail.py` — Generates an SVG file in `assets/` using a hardcoded gradient template. Called by Content Validator on approval; the file is uploaded to Notion then deleted locally.
 
